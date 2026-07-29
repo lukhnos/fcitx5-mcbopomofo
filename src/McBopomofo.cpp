@@ -337,24 +337,6 @@ class McBopomofoDirectInsertWord : public fcitx::CandidateWord {
   KeyHandler::StateCallback callback;
 };
 
-class McBopomofoIrohaWord : public fcitx::CandidateWord {
- public:
-  explicit McBopomofoIrohaWord(fcitx::Text displayText, std::string text,
-                               KeyHandler::StateCallback callback)
-      : fcitx::CandidateWord(std::move(displayText)),
-        text(std::move(text)),
-        callback(std::move(callback)) {}
-  void select(fcitx::InputContext* /*unused*/) const override {
-    auto seq = std::make_unique<InputStates::StateSequence>();
-    seq->push_back(std::make_unique<InputStates::Committing>(text));
-    seq->push_back(std::make_unique<InputStates::Iroha>(""));
-    callback(std::move(seq));
-  }
-
-  std::string text;
-  KeyHandler::StateCallback callback;
-};
-
 class McBopomofoTextOnlyCandidateWord : public fcitx::CandidateWord {
  public:
   explicit McBopomofoTextOnlyCandidateWord(fcitx::Text displayText)
@@ -824,6 +806,23 @@ void McBopomofoEngine::keyEvent(const fcitx::InputMethodEntry& /*unused*/,
     }
   }
 
+  InputStates::IcuTransformInput* maybeIcuTransformInput =
+      dynamic_cast<InputStates::IcuTransformInput*>(state_.get());
+  if (maybeIcuTransformInput != nullptr) {
+    bool handled = keyHandler_->handleIcuTransformInput(
+        MapFcitxKey(key, origKey), maybeIcuTransformInput,
+        [this, context](std::unique_ptr<InputState> next) {
+          enterNewState(context, std::move(next));
+        },
+        []() {
+          // TODO(unassigned): beep?
+        });
+    if (handled) {
+      keyEvent.filterAndAccept();
+      return;
+    }
+  }
+
   if (dynamic_cast<InputStates::ChoosingCandidate*>(state_.get()) != nullptr ||
       dynamic_cast<InputStates::SelectingDictionary*>(state_.get()) !=
           nullptr ||
@@ -835,7 +834,7 @@ void McBopomofoEngine::keyEvent(const fcitx::InputMethodEntry& /*unused*/,
       dynamic_cast<InputStates::SelectingDateMacro*>(state_.get()) != nullptr ||
       dynamic_cast<InputStates::CustomMenu*>(state_.get()) != nullptr ||
       dynamic_cast<InputStates::NumberInput*>(state_.get()) != nullptr ||
-      dynamic_cast<InputStates::IrohaCandidate*>(state_.get()) != nullptr) {
+      dynamic_cast<InputStates::IcuTransformInput*>(state_.get()) != nullptr) {
     // Absorb all keys when the candidate panel is on.
     keyEvent.filterAndAccept();
 
@@ -871,7 +870,6 @@ void McBopomofoEngine::keyEvent(const fcitx::InputMethodEntry& /*unused*/,
         dynamic_cast<InputStates::SelectingFeature*>(state_.get()) != nullptr ||
         dynamic_cast<InputStates::SelectingDateMacro*>(state_.get()) !=
             nullptr ||
-        dynamic_cast<InputStates::IrohaCandidate*>(state_.get()) != nullptr ||
         dynamic_cast<InputStates::CustomMenu*>(state_.get()) != nullptr) {
       context->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
       context->updatePreedit();
@@ -907,6 +905,8 @@ bool McBopomofoEngine::handleCandidateKeyEvent(
       dynamic_cast<InputStates::AssociatedPhrasesPlain*>(state_.get());
   InputStates::NumberInput* numberInput =
       dynamic_cast<InputStates::NumberInput*>(state_.get());
+  InputStates::IcuTransformInput* icuTransformInput =
+      dynamic_cast<InputStates::IcuTransformInput*>(state_.get());
   InputStates::ChoosingPunctuationList* choosingPunctuationList =
       dynamic_cast<InputStates::ChoosingPunctuationList*>(state_.get());
 
@@ -937,7 +937,7 @@ bool McBopomofoEngine::handleCandidateKeyEvent(
   bool shouldUseShiftKey = associatedPhrasesPlain != nullptr;
 
   // Plain Bopomofo, Associated Phrases, and Number Input.
-  if (shouldUseShiftKey || numberInput != nullptr) {
+  if (shouldUseShiftKey || numberInput != nullptr || icuTransformInput != nullptr) {
     int code = origKey.code();
     // Shift-[1-9] keys can only be checked via raw key codes. The Key objects
     // in the selectionKeys_ do not carry such information.
@@ -1541,19 +1541,17 @@ void McBopomofoEngine::enterNewState(fcitx::InputContext* context,
   } else if (auto* numberInput =
                  dynamic_cast<InputStates::NumberInput*>(currentPtr)) {
     handleCandidatesState(context, prevPtr, numberInput);
+  } else if (auto* icuTransformInput =
+                 dynamic_cast<InputStates::IcuTransformInput*>(currentPtr)) {
+    handleCandidatesState(context, prevPtr, icuTransformInput);
   } else if (auto* selectingFeature =
-                 dynamic_cast<InputStates::SelectingFeature*>(currentPtr)) {
+               dynamic_cast<InputStates::SelectingFeature*>(currentPtr)) {
     handleCandidatesState(context, prevPtr, selectingFeature);
   } else if (auto* selectingDateMacro =
                  dynamic_cast<InputStates::SelectingDateMacro*>(currentPtr)) {
     handleCandidatesState(context, prevPtr, selectingDateMacro);
   } else if (auto* big5 = dynamic_cast<InputStates::Big5*>(currentPtr)) {
-    handleStateWithCustomInput(context, big5->composingBuffer());
-  } else if (auto* iroha = dynamic_cast<InputStates::Iroha*>(currentPtr)) {
-    handleStateWithCustomInput(context, iroha->composingBuffer());
-  } else if (auto* irohaCandidates =
-                 dynamic_cast<InputStates::IrohaCandidate*>(currentPtr)) {
-    handleCandidatesState(context, prevPtr, irohaCandidates);
+    handleStateWithCustomInput(context, big5->composingBuffer());  
   } else if (auto* customMenu =
                  dynamic_cast<InputStates::CustomMenu*>(currentPtr)) {
     handleCandidatesState(context, prevPtr, customMenu);
@@ -1625,11 +1623,11 @@ void McBopomofoEngine::handleCandidatesState(fcitx::InputContext* context,
       dynamic_cast<InputStates::AssociatedPhrasesPlain*>(state_.get());
   InputStates::NumberInput* numberInput =
       dynamic_cast<InputStates::NumberInput*>(state_.get());
-  InputStates::IrohaCandidate* irohaCandidates =
-      dynamic_cast<InputStates::IrohaCandidate*>(state_.get());
+  InputStates::IcuTransformInput* icuTransformInput =
+      dynamic_cast<InputStates::IcuTransformInput*>(state_.get());
 
-  bool useShiftKey =
-      numberInput != nullptr || associatedPhrasesPlain != nullptr;
+  bool useShiftKey = numberInput != nullptr || icuTransformInput != nullptr ||
+                     associatedPhrasesPlain != nullptr;
 
   if ((associatedPhrases != nullptr && associatedPhrases->autoTriggered)) {
     selectionKeys_ = fcitx::Key::keyListFromString("Shift+Return");
@@ -1808,11 +1806,11 @@ void McBopomofoEngine::handleCandidatesState(fcitx::InputContext* context,
                                                        displayText, callback);
       candidateList->append(std::move(candidate));
     }
-  } else if (irohaCandidates != nullptr) {
-    for (const auto& displayText : irohaCandidates->candidates) {
+  } else if (icuTransformInput != nullptr) {
+    for (const auto& displayText : icuTransformInput->candidates) {
       std::unique_ptr<fcitx::CandidateWord> candidate =
-          std::make_unique<McBopomofoIrohaWord>(fcitx::Text(displayText),
-                                                displayText, callback);
+          std::make_unique<McBopomofoDirectInsertWord>(fcitx::Text(displayText),
+                                                       displayText, callback);
       candidateList->append(std::move(candidate));
     }
   } else if (customMenu != nullptr) {
@@ -1872,6 +1870,7 @@ fcitx::CandidateLayoutHint McBopomofoEngine::getCandidateLayoutHint() const {
   fcitx::CandidateLayoutHint layoutHint = fcitx::CandidateLayoutHint::NotSet;
 
   if (dynamic_cast<InputStates::NumberInput*>(state_.get()) != nullptr ||
+      dynamic_cast<InputStates::IcuTransformInput*>(state_.get()) != nullptr ||
       dynamic_cast<InputStates::SelectingDictionary*>(state_.get()) !=
           nullptr ||
       dynamic_cast<InputStates::ShowingCharInfo*>(state_.get()) != nullptr ||
